@@ -6,5 +6,5 @@ if not exist .venv (
 )
 call .venv\Scripts\activate.bat
 python -m pip install -q --upgrade pip
-python -m pip install -q --upgrade -r requirements.txt
+python -m pip install -q --upgrade -r requirements.txt || (echo. & echo HATA: Python 3.10 veya daha yeni gerekli: https://www.python.org/downloads/ & pause & exit /b 1)
 start "" pythonw main.py
