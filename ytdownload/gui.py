@@ -14,6 +14,8 @@ from tkinter import filedialog, messagebox, ttk
 from . import core
 
 DEFAULT_DOWNLOAD_DIR = Path.home() / "Music" / "YTDownload"
+# Görünen ad → core.download_album audio_format
+FORMATS = ["m4a (orijinal kalite)", "mp3"]
 
 
 class App(tk.Tk):
@@ -28,7 +30,7 @@ class App(tk.Tk):
         self._drives: list[core.Drive] = []
 
         self.url_var = tk.StringVar()
-        self.format_var = tk.StringVar(value="mp3")
+        self.format_var = tk.StringVar(value=FORMATS[0])
         self.quality_var = tk.StringVar(value="192")
         self.dl_dir_var = tk.StringVar(value=str(DEFAULT_DOWNLOAD_DIR))
         self.drive_var = tk.StringVar()
@@ -56,9 +58,15 @@ class App(tk.Tk):
         ttk.Label(root, text="Format / Kalite:").grid(row=1, column=0, sticky="w", **pad)
         fmt = ttk.Frame(root)
         fmt.grid(row=1, column=1, columnspan=3, sticky="w", **pad)
-        ttk.Combobox(fmt, textvariable=self.format_var, values=["mp3", "m4a"], width=6, state="readonly").pack(side="left")
-        ttk.Combobox(fmt, textvariable=self.quality_var, values=["128", "192", "256", "320"], width=6, state="readonly").pack(side="left", padx=6)
-        ttk.Label(fmt, text="kbps").pack(side="left")
+        fmt_combo = ttk.Combobox(fmt, textvariable=self.format_var, values=FORMATS, width=20, state="readonly")
+        fmt_combo.pack(side="left")
+        fmt_combo.bind("<<ComboboxSelected>>", lambda e: self._toggle_quality())
+        self.quality_combo = ttk.Combobox(fmt, textvariable=self.quality_var, values=["128", "192", "256", "320"],
+                                          width=6, state="readonly")
+        self.quality_combo.pack(side="left", padx=6)
+        self.quality_label = ttk.Label(fmt, text="kbps")
+        self.quality_label.pack(side="left")
+        self._toggle_quality()
 
         ttk.Label(root, text="Bilgisayarda kayıt:").grid(row=2, column=0, sticky="w", **pad)
         ttk.Entry(root, textvariable=self.dl_dir_var).grid(row=2, column=1, columnspan=2, sticky="ew", **pad)
@@ -132,6 +140,15 @@ class App(tk.Tk):
         else:
             subprocess.Popen(["xdg-open", path])
 
+    def _audio_format(self) -> str:
+        return self.format_var.get().split()[0]
+
+    def _toggle_quality(self):
+        # m4a'da ses dönüştürülmediği için kalite ayarı anlamsız
+        is_mp3 = self._audio_format() == "mp3"
+        self.quality_combo.configure(state="readonly" if is_mp3 else "disabled")
+        self.quality_label.configure(text="kbps" if is_mp3 else "kbps (m4a'da dönüştürme yapılmaz)")
+
     def _toggle_copy(self):
         state = "normal" if self.copy_var.get() else "disabled"
         self.drive_combo.configure(state="readonly" if state == "normal" else "disabled")
@@ -176,7 +193,7 @@ class App(tk.Tk):
         self._cancel.clear()
         self._set_running(True)
         self.progress["value"] = 0
-        args = (url, Path(self.dl_dir_var.get()), self.format_var.get(), self.quality_var.get(),
+        args = (url, Path(self.dl_dir_var.get()), self._audio_format(), self.quality_var.get(),
                 drive.path if drive else None, self.subfolder_var.get())
         self._worker = threading.Thread(target=self._run, args=args, daemon=True)
         self._worker.start()
@@ -193,14 +210,17 @@ class App(tk.Tk):
             # İndirme ilerlemenin %0-80'i, kopyalama %80-100'ü
             scale = 0.8 if card else 1.0
             album_dir = core.download_album(
-                url, dl_dir, fmt, quality, log=log,
+                url, dl_dir, fmt, quality, library_dirs=[card] if card else None, log=log,
                 progress=lambda f, s: emit(("progress", f * scale, s)), is_cancelled=cancelled)
             if card:
                 dest = core.copy_to_card(
                     album_dir, card, subfolder, log=log,
                     progress=lambda f, s: emit(("progress", 0.8 + f * 0.2, s)), is_cancelled=cancelled)
-                emit(("done", f"Tamamlandı! Şarkılar karta aktarıldı:\n{dest}\n\nKartı çıkarmadan önce "
-                              f"işletim sisteminden 'Güvenli Çıkar' yapmayı unutmayın."))
+                if dest is None:
+                    emit(("done", "Tamamlandı! Bu albümdeki şarkıların hepsi zaten kartta / bilgisayarda vardı."))
+                else:
+                    emit(("done", f"Tamamlandı! Şarkılar karta aktarıldı:\n{dest}\n\nKartı çıkarmadan önce "
+                                  f"işletim sisteminden 'Güvenli Çıkar' yapmayı unutmayın."))
             else:
                 emit(("done", f"Tamamlandı! Şarkılar indirildi:\n{album_dir}"))
         except core.Cancelled:

@@ -6,12 +6,17 @@ MP3 (veya M4A) olarak indirip **microSD karta otomatik aktaran** küçük bir ma
 
 ## Özellikler
 - Albüm / playlist linkini yapıştır → **İndir ve Aktar**
+- **M4A (orijinal kalite):** YouTube'un sesi dönüştürülmeden, birebir kopyalanır (kalite kaybı yok).
+  MP3 seçilirse ses MP3'e dönüştürülür (eski cihazlar için).
+- **Aynı şarkı iki kez inmez:** bilgisayardaki indirme klasörü ve microSD kart taranır;
+  aynı şarkı başka bir albümde / başka bir videoda indirilmiş olsa bile atlanır
 - Şarkılar `01 - Şarkı Adı.mp3` şeklinde sıralı adlandırılır
 - Parça numarası, albüm adı, sanatçı ve kapak resmi dosyaya gömülür (araba teyplerinde / MP3 çalarlarda düzgün görünür)
 - microSD kart otomatik algılanır (Windows: çıkarılabilir sürücüler, Mac: `/Volumes`)
 - Kopyalamadan önce kartta yeterli boş alan kontrol edilir
 - Karttaki yol: `<Kart>/Music/<Albüm Adı>/` (klasör adı değiştirilebilir)
 - Yarıda kalırsa tekrar çalıştırın: zaten inen/kopyalanan şarkılar atlanır
+  (bir şarkıyı yeniden indirmek isterseniz dosyasını silmeniz yeterli)
 - İlerleme çubuğu, günlük penceresi ve İptal düğmesi
 
 ## Kurulum ve çalıştırma

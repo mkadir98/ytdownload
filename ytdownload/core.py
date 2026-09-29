@@ -172,16 +172,140 @@ def fetch_playlist_title(url: str) -> str:
     return info.get("title") or info.get("id") or "Album"
 
 
+# --------------------------------------------------------------------------- #
+# Kütüphane taraması: aynı şarkının iki kez indirilmesini önler
+# --------------------------------------------------------------------------- #
+_YT_ID = re.compile(r"(?:[?&]v=|youtu\.be/|/shorts/)([\w-]{11})")
+_BRACKETS = re.compile(r"[\(\[\{][^\)\]\}]*[\)\]\}]")
+_NOISE = re.compile(r"\b(official|music|lyric|lyrics|video|audio|hd|hq|4k|visualizer|clip|resmi|klip)\b")
+_NON_WORD = re.compile(r"[^\w]+")
+
+
+def _norm(text: str) -> str:
+    text = _BRACKETS.sub(" ", text.casefold())
+    text = _NOISE.sub(" ", text)
+    return " ".join(_NON_WORD.sub(" ", text).replace("_", " ").split())
+
+
+def song_key(artist: str | None, title: str | None) -> str | None:
+    """Sanatçı + şarkı adından karşılaştırma anahtarı. İkisi de yoksa None."""
+    if not artist or not title:
+        return None
+    artist = re.sub(r"\s*-\s*topic$", "", artist.strip(), flags=re.I)
+    # "Sanatçı A, Sanatçı B" / "A & B" → sadece ilk sanatçı
+    artist = re.split(r",|&| feat\.? | ft\.? ", artist, maxsplit=1, flags=re.I)[0]
+    a, t = _norm(artist), _norm(title)
+    # Başlık "Sanatçı - Şarkı" şeklindeyse sanatçı kısmını at
+    if t.startswith(a + " "):
+        t = t[len(a) + 1:]
+    return f"{a}|{t}" if a and t else None
+
+
+def _read_tags(path: Path) -> tuple[str | None, str | None, str]:
+    """(sanatçı, şarkı adı, yorum/link) döndürür."""
+    try:
+        import mutagen
+
+        f = mutagen.File(path)
+    except Exception:
+        return None, None, ""
+    if f is None or f.tags is None:
+        return None, None, ""
+    tags = f.tags
+
+    def first(*keys):
+        for k in keys:
+            try:
+                v = tags.get(k) if hasattr(tags, "get") else None
+            except Exception:
+                v = None
+            if v:
+                v = v[0] if isinstance(v, list) else getattr(v, "text", [v])[0]
+                return str(v)
+        return None
+
+    if hasattr(tags, "getall"):  # MP3 (ID3)
+        comment = " ".join(str(t) for fr in tags.getall("COMM") for t in fr.text)
+        comment += " ".join(str(t) for fr in tags.getall("TXXX") for t in fr.text)
+        return first("TPE1"), first("TIT2"), comment
+    # M4A / OGG / FLAC
+    comment = " ".join(str(x) for k in ("\xa9cmt", "comment", "purl", "COMMENT", "PURL") for x in (tags.get(k) or []))
+    return first("\xa9ART", "artist", "ARTIST"), first("\xa9nam", "title", "TITLE"), comment
+
+
+@dataclass
+class Library:
+    ids: dict[str, str]  # YouTube video id → dosya yolu
+    keys: dict[str, str]  # sanatçı|şarkı → dosya yolu
+
+    def find(self, info: dict) -> str | None:
+        """Bu şarkı daha önce indirildiyse mevcut dosyanın yolunu döndürür."""
+        vid = info.get("id")
+        if vid and vid in self.ids:
+            return self.ids[vid]
+        key = song_key(_info_artist(info), info.get("track") or info.get("title"))
+        return self.keys.get(key) if key else None
+
+    def add(self, info: dict, where: str):
+        if info.get("id"):
+            self.ids[info["id"]] = where
+        key = song_key(_info_artist(info), info.get("track") or info.get("title"))
+        if key:
+            self.keys[key] = where
+
+
+def _info_artist(info: dict) -> str | None:
+    artists = info.get("artists")
+    if artists:
+        return artists[0]
+    return info.get("artist") or info.get("creator") or info.get("uploader")
+
+
+def scan_library(folders: list[str | Path], log: Log = print) -> Library:
+    lib = Library({}, {})
+    count = 0
+    for folder in folders:
+        folder = Path(folder)
+        if not folder.is_dir():
+            continue
+        for dirpath, dirnames, filenames in os.walk(folder):
+            # Gizli sistem klasörlerini atla (.Trashes, .Spotlight-V100, System Volume Information...)
+            dirnames[:] = [d for d in dirnames if not d.startswith(".") and d != "System Volume Information"]
+            for name in filenames:
+                if name.startswith(".") or Path(name).suffix.lower() not in AUDIO_EXTS:
+                    continue
+                path = Path(dirpath) / name
+                artist, title, comment = _read_tags(path)
+                where = str(path)
+                m = _YT_ID.search(comment)
+                if m:
+                    lib.ids.setdefault(m.group(1), where)
+                if not title:  # etiket yoksa dosya adından: "01 - Şarkı.mp3"
+                    title = re.sub(r"^\d+\s*-\s*", "", path.stem)
+                key = song_key(artist, title)
+                if key:
+                    lib.keys.setdefault(key, where)
+                count += 1
+    log(f"Kütüphane tarandı: {count} şarkı bulundu.")
+    return lib
+
+
 def download_album(
     url: str,
     out_root: Path,
-    audio_format: str = "mp3",
+    audio_format: str = "m4a",
     quality: str = "192",
+    library_dirs: list[str | Path] | None = None,
     log: Log = print,
     progress: Progress = lambda f, s: None,
     is_cancelled: Callable[[], bool] = lambda: False,
 ) -> Path:
-    """Albümü/çalma listesini `out_root/<Albüm Adı>/` klasörüne indirir ve klasörü döndürür."""
+    """Albümü/çalma listesini `out_root/<Albüm Adı>/` klasörüne indirir ve klasörü döndürür.
+
+    audio_format="m4a": YouTube'un AAC sesi dönüştürülmeden kopyalanır (kalite kaybı yok).
+    audio_format="mp3": ses MP3'e dönüştürülür (`quality` kbps).
+    Daha önce indirilmiş şarkılar (out_root ve library_dirs içinde) atlanır.
+    """
     ffmpeg = find_ffmpeg()
     if not ffmpeg:
         raise RuntimeError("ffmpeg bulunamadı. 'pip install imageio-ffmpeg' komutunu çalıştırın.")
@@ -192,6 +316,25 @@ def download_album(
     album_dir.mkdir(parents=True, exist_ok=True)
     log(f"Albüm: {title}")
     log(f"İndirme klasörü: {album_dir}")
+
+    log("Daha önce indirilen şarkılar kontrol ediliyor...")
+    library = scan_library([out_root, *(library_dirs or [])], log)
+    stats = {"skipped": 0}
+
+    def skip_duplicates(info, *, incomplete):
+        if incomplete or info.get("_type") == "playlist":
+            return None
+        if is_cancelled():
+            raise Cancelled()
+        existing = library.find(info)
+        name = info.get("track") or info.get("title") or info.get("id")
+        if existing:
+            stats["skipped"] += 1
+            log(f"↷ Atlandı, zaten var: {name}  ({existing})")
+            return "zaten indirilmiş"
+        # Aynı albümde iki kez geçse bile bir kez indir
+        library.add(info, f"{album_dir.name} (bu indirme)")
+        return None
 
     state = {"index": 0, "total": 0}
 
@@ -229,13 +372,15 @@ def download_album(
                 (MetadataParserPP.interpretter, "playlist_title", "%(album)s"),
             ],
         },
+        # m4a: kaynak AAC ise ffmpeg sadece kopyalar (yeniden kodlama yok)
         {"key": "FFmpegExtractAudio", "preferredcodec": audio_format, "preferredquality": quality},
         {"key": "FFmpegMetadata", "add_metadata": True},
         {"key": "EmbedThumbnail", "already_have_thumbnail": False},
     ]
 
     opts = {
-        "format": "bestaudio/best",
+        "format": "bestaudio[ext=m4a]/bestaudio/best" if audio_format == "m4a" else "bestaudio/best",
+        "match_filter": skip_duplicates,
         "outtmpl": str(album_dir / "%(playlist_index)02d - %(title)s.%(ext)s"),
         "windowsfilenames": True,  # SD kartta (FAT32/exFAT) geçersiz karakterleri temizler
         "ignoreerrors": True,  # tek parça hata verirse albümün geri kalanı devam etsin
@@ -248,7 +393,6 @@ def download_album(
         "quiet": True,
         "no_warnings": True,
         "noprogress": True,
-        "download_archive": str(album_dir / ".downloaded.txt"),  # tekrar çalıştırınca inenleri atla
     }
     deno_bin = find_deno()
     if deno_bin:
@@ -276,6 +420,8 @@ def download_album(
         ydl.download([url])
     if is_cancelled():
         raise Cancelled()
+    if stats["skipped"]:
+        log(f"{stats['skipped']} şarkı zaten indirilmiş olduğu için atlandı.")
     progress(1.0, "İndirme tamamlandı")
     return album_dir
 
@@ -290,10 +436,12 @@ def copy_to_card(
     log: Log = print,
     progress: Progress = lambda f, s: None,
     is_cancelled: Callable[[], bool] = lambda: False,
-) -> Path:
+) -> Path | None:
     files = sorted(p for p in album_dir.iterdir() if p.is_file() and p.suffix.lower() in AUDIO_EXTS)
     if not files:
-        raise RuntimeError("Kopyalanacak müzik dosyası bulunamadı.")
+        log("Karta kopyalanacak yeni şarkı yok (hepsi zaten mevcut).")
+        progress(1.0, "Yeni şarkı yok")
+        return None
 
     dest = Path(card_root)
     if sub_folder.strip():
