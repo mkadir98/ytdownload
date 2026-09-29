@@ -1,0 +1,51 @@
+name: Build apps
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - os: windows-latest
+            name: YTAlbumSD-Windows
+            deno: deno.exe
+            sep: ";"
+          - os: macos-latest
+            name: YTAlbumSD-macOS
+            deno: deno
+            sep: ":"
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pyinstaller
+      - name: Locate deno binary
+        shell: bash
+        run: echo "DENO_BIN=$(python -c 'import deno; print(deno.find_deno_bin())')" >> "$GITHUB_ENV"
+      - name: Build with PyInstaller
+        shell: bash
+        run: |
+          pyinstaller --noconfirm --windowed --name YTAlbumSD \
+            --collect-all imageio_ffmpeg --collect-all yt_dlp --collect-all yt_dlp_ejs \
+            --add-binary "${DENO_BIN}${{ matrix.sep }}." \
+            main.py
+      - name: Package (macOS)
+        if: runner.os == 'macOS'
+        run: cd dist && ditto -c -k --keepParent YTAlbumSD.app ../${{ matrix.name }}.zip
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: Compress-Archive -Path dist/YTAlbumSD -DestinationPath ${{ matrix.name }}.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}
+          path: ${{ matrix.name }}.zip
