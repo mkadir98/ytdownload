@@ -242,25 +242,33 @@ def _read_tags(path: Path) -> tuple[str | None, str | None, str]:
 
 @dataclass
 class Library:
-    ids: dict[str, str] = dataclasses.field(default_factory=dict)  # YouTube video id → dosya yolu
-    keys: dict[str, str] = dataclasses.field(default_factory=dict)  # sanatçı|şarkı → dosya yolu
+    ids: dict[str, list[str]] = dataclasses.field(default_factory=dict)  # YouTube video id → dosya yolları
+    keys: dict[str, list[str]] = dataclasses.field(default_factory=dict)  # sanatçı|şarkı → dosya yolları
 
     lock: threading.Lock = dataclasses.field(default_factory=threading.Lock)
 
-    def find(self, info: dict) -> str | None:
-        """Bu şarkı daha önce indirildiyse mevcut dosyanın yolunu döndürür."""
-        vid = info.get("id")
-        if vid and vid in self.ids:
-            return self.ids[vid]
+    def find(self, info: dict, ext: str | None = None) -> str | None:
+        """Bu şarkı daha önce indirildiyse mevcut dosyanın yolunu döndürür.
+
+        `ext` (".mp3" gibi) verilirse yalnızca o formattaki kopyalar sayılır; böylece
+        m4a'dan mp3'e geçen kullanıcı şarkıları yeni formatta tekrar indirebilir.
+        """
         key = song_key(_info_artist(info), info.get("track") or info.get("title"))
-        return self.keys.get(key) if key else None
+        candidates = self.ids.get(info.get("id") or "", []) + (self.keys.get(key, []) if key else [])
+        for where in candidates:
+            if ext is None or where.lower().endswith(ext) or where.endswith(PENDING):
+                return where
+        return None
 
     def add(self, info: dict, where: str):
         if info.get("id"):
-            self.ids[info["id"]] = where
+            self.ids.setdefault(info["id"], []).append(where)
         key = song_key(_info_artist(info), info.get("track") or info.get("title"))
         if key:
-            self.keys[key] = where
+            self.keys.setdefault(key, []).append(where)
+
+
+PENDING = " (bu indirme)"
 
 
 def _info_artist(info: dict) -> str | None:
@@ -312,9 +320,9 @@ def scan_library(folders: list[str | Path], cache_file: Path | None = None, log:
                     read += 1
                 new_cache[where] = entry
                 if entry["id"]:
-                    lib.ids.setdefault(entry["id"], where)
+                    lib.ids.setdefault(entry["id"], []).append(where)
                 if entry["key"]:
-                    lib.keys.setdefault(entry["key"], where)
+                    lib.keys.setdefault(entry["key"], []).append(where)
                 count += 1
     if cache_file:
         # Şu an takılı olmayan kartların kayıtlarını da koru
@@ -380,6 +388,23 @@ class Result:
     skipped: int = 0
     failed: int = 0
     copied: int = 0
+
+
+def clean_mac_junk(folder: Path) -> int:
+    """macOS'un FAT/exFAT kartlara bıraktığı `._*` ve `.DS_Store` dosyalarını siler.
+    Android telefonlar `._Şarkı.m4a` dosyalarını şarkı sanıp "desteklenmeyen format" der."""
+    removed = 0
+    if not folder.is_dir():
+        return 0
+    for dirpath, _dirs, files in os.walk(folder):
+        for name in files:
+            if name.startswith("._") or name == ".DS_Store":
+                try:
+                    os.remove(os.path.join(dirpath, name))
+                    removed += 1
+                except OSError:
+                    pass
+    return removed
 
 
 def card_album_dir(card_root: str, sub_folder: str, album_name: str) -> Path:
@@ -467,6 +492,12 @@ def download_album(
             with state_lock:
                 result.copied += 1
             log(f"  → karta kopyalandı: {src.name}")
+            # Aynı şarkının başka formattaki eski kopyası kartta kalmasın (ör. m4a → mp3 geçişi)
+            for ext in AUDIO_EXTS - {src.suffix.lower()}:
+                old = card_dir / (src.stem + ext)
+                if old.exists():
+                    old.unlink()
+                    log(f"  ✗ eski format kaldırıldı: {old.name}")
         except Exception as e:  # noqa: BLE001
             log(f"Hata: karta kopyalanamadı: {src.name}: {e}")
 
@@ -491,10 +522,10 @@ def download_album(
             if incomplete:
                 return None
             with library.lock:
-                existing = library.find(info)
+                existing = library.find(info, "." + audio_format)
                 if not existing:
                     # Aynı albümde iki kez geçse bile bir kez indir
-                    library.add(info, f"{album_dir.name} (bu indirme)")
+                    library.add(info, album_dir.name + PENDING)
             if existing:
                 skipped.append(existing)
                 log(f"↷ Atlandı, zaten var: {info.get('track') or info.get('title')}  ({existing})")
@@ -569,12 +600,16 @@ def download_album(
     # Önceden bilgisayara inmiş ama kartta olmayan şarkıları da tamamla
     if card_dir:
         leftovers = [p for p in sorted(album_dir.iterdir())
-                     if p.is_file() and p.suffix.lower() in AUDIO_EXTS
+                     if p.is_file() and p.suffix.lower() == "." + audio_format
                      and not ((card_dir / p.name).exists() and (card_dir / p.name).stat().st_size == p.stat().st_size)]
         for p in leftovers:
             if is_cancelled():
                 raise Cancelled()
             copy_one(p)
+        # Önceki albümlerde kalanlar dahil tüm müzik klasörünü temizle
+        removed = clean_mac_junk(card_dir.parent if sub_folder.strip() else card_dir)
+        if removed:
+            log(f"Karttaki {removed} gizli Mac dosyası (._*) temizlendi.")
 
     summary = f"{result.downloaded} şarkı indirildi"
     if result.skipped:

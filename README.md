@@ -67,6 +67,9 @@ Oluşan zip dosyaları Python kurulumu gerektirmez.
   (`run_*.bat/.command` her açılışta bunu otomatik yapar). YouTube sık değişiklik yapar.
 - **İndirmeler hata veriyor / YouTube engelliyor:** "Aynı anda" sayısını 1-2'ye düşürün.
 - **Kopyalama yavaş:** kartın U3/V30/A1 sınıfı ve USB 3 kart okuyucu kullanın; hızı çoğunlukla kart belirler.
+- **Telefonda "desteklenmeyen format" uyarısı:** Mac'in karta bıraktığı gizli `._` dosyalarından kaynaklanır;
+  program her aktarımda bunları siler. Telefon M4A çalamıyorsa format olarak **mp3** seçip albümü
+  tekrar çalıştırın: şarkılar MP3 olarak iner ve karttaki eski M4A kopyaları kaldırılır.
 - **Kart görünmüyor:** kartın bilgisayarda açıldığından emin olun, **Yenile**'ye basın veya **Klasör...** ile seçin.
 
 ## Not
