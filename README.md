@@ -14,6 +14,14 @@ MP3 (veya M4A) olarak indirip **microSD karta otomatik aktaran** küçük bir ma
 - Parça numarası, albüm adı, sanatçı ve kapak resmi dosyaya gömülür (araba teyplerinde / MP3 çalarlarda düzgün görünür)
 - **Hızlı:** aynı anda 3 şarkı iner (1-6 arası ayarlanabilir) ve her şarkı iner inmez karta
   kopyalanır; albüm bittiğinde kopyalama da bitmiş olur
+- **Şarkı adlarını kısaltma (tuşlu / küçük ekranlı telefonlar için):**
+  `04 - Gripin- Durma Yağmur Durma (piyano cover)- İlayda Su Çakıroğlu.mp3` → `04 Durma Yağmur Durma.mp3`.
+  Hem dosya adı hem dosyanın içindeki şarkı adı etiketi kısaltılır. İki yol var:
+  - İndirirken: **Şarkı adları → Kısalt** kutusunu işaretleyin.
+  - Mevcut şarkılar için: **Şarkı adlarını kısalt...** düğmesi. Önce önizleme gösterir; adı elle
+    düzeltmek için satıra çift tıklayın, istemediğinizi **Seçilenleri atla** ile çıkarın, **Uygula**
+    deyin. Beğenmezseniz **Geri Al**.
+  - Deneme (hiçbir şeyi değiştirmez): `python -m ytdownload.rename "<klasör>"`
 - microSD kart otomatik algılanır (Windows: çıkarılabilir sürücüler, Mac: `/Volumes`)
 - Kopyalamadan önce kartta yeterli boş alan kontrol edilir
 - Karttaki yol: `<Kart>/Music/<Albüm Adı>/` (klasör adı değiştirilebilir)

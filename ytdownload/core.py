@@ -240,6 +240,26 @@ def _read_tags(path: Path) -> tuple[str | None, str | None, str]:
     return first("\xa9ART", "artist", "ARTIST"), first("\xa9nam", "title", "TITLE"), comment
 
 
+ORIGINAL_TITLE = "ORIGINAL_TITLE"  # ad kısaltılınca orijinal başlık bu etikette saklanır
+
+
+def _read_original_title(path: Path) -> str | None:
+    try:
+        import mutagen
+
+        f = mutagen.File(path)
+        tags = f.tags if f else None
+        if tags is None:
+            return None
+        if hasattr(tags, "getall"):  # MP3
+            frames = tags.getall(f"TXXX:{ORIGINAL_TITLE}")
+            return str(frames[0].text[0]) if frames and frames[0].text else None
+        value = tags.get(f"----:com.apple.iTunes:{ORIGINAL_TITLE}")
+        return bytes(value[0]).decode("utf-8", "ignore") if value else None
+    except Exception:
+        return None
+
+
 @dataclass
 class Library:
     ids: dict[str, list[str]] = dataclasses.field(default_factory=dict)  # YouTube video id → dosya yolları
@@ -313,6 +333,7 @@ def scan_library(folders: list[str | Path], cache_file: Path | None = None, log:
                 entry = cache.get(where)
                 if not entry or entry.get("stamp") != stamp:
                     artist, title, comment = _read_tags(path)
+                    title = _read_original_title(path) or title  # kısaltılmış dosyalar için
                     m = _YT_ID.search(comment)
                     if not title:  # etiket yoksa dosya adından: "01 - Şarkı.mp3"
                         title = re.sub(r"^\d+\s*-\s*", "", path.stem)
@@ -422,6 +443,7 @@ def download_album(
     card_root: str | None = None,
     sub_folder: str = "Music",
     workers: int = 3,
+    rename_opts=None,
     log: Log = print,
     progress: Progress = lambda f, s: None,
     is_cancelled: Callable[[], bool] = lambda: False,
@@ -433,6 +455,7 @@ def download_album(
     - audio_format="m4a": YouTube'un AAC sesi dönüştürülmeden kopyalanır (kalite kaybı yok).
       audio_format="mp3": ses MP3'e dönüştürülür (`quality` kbps).
     - Bilgisayarda veya kartta zaten bulunan şarkılar atlanır.
+    - `rename_opts` (rename.RenameOptions) verilirse şarkı adları kısaltılır.
     """
     ffmpeg = find_ffmpeg()
     if not ffmpeg:
@@ -563,6 +586,13 @@ def download_album(
             downloads = (info or {}).get("requested_downloads") or []
             path = downloads[0].get("filepath") if downloads else None
             ok = bool(path and os.path.exists(path))
+            if ok and rename_opts:
+                from .rename import shorten_downloaded
+
+                try:
+                    path = str(shorten_downloaded(Path(path), info, track_no, rename_opts))
+                except Exception as e:  # noqa: BLE001 - kısaltılamazsa uzun adla devam et
+                    log(f"Uyarı: ad kısaltılamadı ({Path(path).name}): {e}")
             with state_lock:
                 if ok:
                     result.downloaded += 1
@@ -599,9 +629,18 @@ def download_album(
 
     # Önceden bilgisayara inmiş ama kartta olmayan şarkıları da tamamla
     if card_dir:
+        card_prefix = str(Path(card_root)).rstrip(os.sep) + os.sep
+
+        def on_card(p: Path) -> bool:
+            if (card_dir / p.name).exists() and (card_dir / p.name).stat().st_size == p.stat().st_size:
+                return True
+            # Kartta başka adla (ör. kısaltılmış) duruyorsa YouTube kimliğinden tanı
+            m = _YT_ID.search(_read_tags(p)[2])
+            return bool(m) and any(x.startswith(card_prefix) and x.lower().endswith(p.suffix.lower())
+                                   for x in library.ids.get(m.group(1), []))
+
         leftovers = [p for p in sorted(album_dir.iterdir())
-                     if p.is_file() and p.suffix.lower() == "." + audio_format
-                     and not ((card_dir / p.name).exists() and (card_dir / p.name).stat().st_size == p.stat().st_size)]
+                     if p.is_file() and p.suffix.lower() == "." + audio_format and not on_card(p)]
         for p in leftovers:
             if is_cancelled():
                 raise Cancelled()
