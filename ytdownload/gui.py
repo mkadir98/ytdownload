@@ -36,6 +36,7 @@ class App(tk.Tk):
         self.drive_var = tk.StringVar()
         self.subfolder_var = tk.StringVar(value="Music")
         self.copy_var = tk.BooleanVar(value=True)
+        self.workers_var = tk.IntVar(value=3)
         self.status_var = tk.StringVar(value="Hazır")
 
         self._build()
@@ -66,6 +67,9 @@ class App(tk.Tk):
         self.quality_combo.pack(side="left", padx=6)
         self.quality_label = ttk.Label(fmt, text="kbps")
         self.quality_label.pack(side="left")
+        ttk.Label(fmt, text="   Aynı anda:").pack(side="left")
+        ttk.Spinbox(fmt, from_=1, to=6, textvariable=self.workers_var, width=3, state="readonly").pack(side="left", padx=4)
+        ttk.Label(fmt, text="şarkı").pack(side="left")
         self._toggle_quality()
 
         ttk.Label(root, text="Bilgisayarda kayıt:").grid(row=2, column=0, sticky="w", **pad)
@@ -194,7 +198,7 @@ class App(tk.Tk):
         self._set_running(True)
         self.progress["value"] = 0
         args = (url, Path(self.dl_dir_var.get()), self._audio_format(), self.quality_var.get(),
-                drive.path if drive else None, self.subfolder_var.get())
+                drive.path if drive else None, self.subfolder_var.get(), self.workers_var.get())
         self._worker = threading.Thread(target=self._run, args=args, daemon=True)
         self._worker.start()
 
@@ -202,27 +206,23 @@ class App(tk.Tk):
         self._cancel.set()
         self.status_var.set("İptal ediliyor...")
 
-    def _run(self, url, dl_dir, fmt, quality, card, subfolder):
+    def _run(self, url, dl_dir, fmt, quality, card, subfolder, workers):
         emit = self._events.put
         log = lambda m: emit(("log", m))
-        cancelled = self._cancel.is_set
         try:
-            # İndirme ilerlemenin %0-80'i, kopyalama %80-100'ü
-            scale = 0.8 if card else 1.0
-            album_dir = core.download_album(
-                url, dl_dir, fmt, quality, library_dirs=[card] if card else None, log=log,
-                progress=lambda f, s: emit(("progress", f * scale, s)), is_cancelled=cancelled)
-            if card:
-                dest = core.copy_to_card(
-                    album_dir, card, subfolder, log=log,
-                    progress=lambda f, s: emit(("progress", 0.8 + f * 0.2, s)), is_cancelled=cancelled)
-                if dest is None:
-                    emit(("done", "Tamamlandı! Bu albümdeki şarkıların hepsi zaten kartta / bilgisayarda vardı."))
-                else:
-                    emit(("done", f"Tamamlandı! Şarkılar karta aktarıldı:\n{dest}\n\nKartı çıkarmadan önce "
-                                  f"işletim sisteminden 'Güvenli Çıkar' yapmayı unutmayın."))
+            # Her şarkı iner inmez karta kopyalanır (indirme ve kopyalama aynı anda)
+            res = core.download_album(
+                url, dl_dir, fmt, quality, card_root=card, sub_folder=subfolder, workers=workers, log=log,
+                progress=lambda f, s: emit(("progress", f, s)), is_cancelled=self._cancel.is_set)
+            msg = f"Tamamlandı!\n\nİndirilen: {res.downloaded}\nZaten vardı (atlandı): {res.skipped}"
+            if res.failed:
+                msg += f"\nİndirilemeyen: {res.failed} (ayrıntılar kayıt penceresinde)"
+            if res.card_dir:
+                msg += (f"\nKarta kopyalanan: {res.copied}\n\nKarttaki klasör:\n{res.card_dir}\n\n"
+                        "Kartı çıkarmadan önce 'Güvenli Çıkar' yapmayı unutmayın.")
             else:
-                emit(("done", f"Tamamlandı! Şarkılar indirildi:\n{album_dir}"))
+                msg += f"\n\nKlasör:\n{res.album_dir}"
+            emit(("done", msg))
         except core.Cancelled:
             emit(("cancelled", None))
         except Exception as e:  # noqa: BLE001 - kullanıcıya göster

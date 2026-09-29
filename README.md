@@ -12,6 +12,8 @@ MP3 (veya M4A) olarak indirip **microSD karta otomatik aktaran** küçük bir ma
   aynı şarkı başka bir albümde / başka bir videoda indirilmiş olsa bile atlanır
 - Şarkılar `01 - Şarkı Adı.mp3` şeklinde sıralı adlandırılır
 - Parça numarası, albüm adı, sanatçı ve kapak resmi dosyaya gömülür (araba teyplerinde / MP3 çalarlarda düzgün görünür)
+- **Hızlı:** aynı anda 3 şarkı iner (1-6 arası ayarlanabilir) ve her şarkı iner inmez karta
+  kopyalanır; albüm bittiğinde kopyalama da bitmiş olur
 - microSD kart otomatik algılanır (Windows: çıkarılabilir sürücüler, Mac: `/Volumes`)
 - Kopyalamadan önce kartta yeterli boş alan kontrol edilir
 - Karttaki yol: `<Kart>/Music/<Albüm Adı>/` (klasör adı değiştirilebilir)
@@ -63,6 +65,8 @@ Oluşan zip dosyaları Python kurulumu gerektirmez.
 ## Sorun giderme
 - **Bazı şarkılar inmedi:** yt-dlp'yi güncelleyin: `pip install -U "yt-dlp[default]"`
   (`run_*.bat/.command` her açılışta bunu otomatik yapar). YouTube sık değişiklik yapar.
+- **İndirmeler hata veriyor / YouTube engelliyor:** "Aynı anda" sayısını 1-2'ye düşürün.
+- **Kopyalama yavaş:** kartın U3/V30/A1 sınıfı ve USB 3 kart okuyucu kullanın; hızı çoğunlukla kart belirler.
 - **Kart görünmüyor:** kartın bilgisayarda açıldığından emin olun, **Yenile**'ye basın veya **Klasör...** ile seçin.
 
 ## Not

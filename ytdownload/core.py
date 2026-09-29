@@ -8,12 +8,17 @@ import re
 import shutil
 import string
 import sys
+import threading
+import json
+from concurrent.futures import ThreadPoolExecutor
+import dataclasses
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
 import yt_dlp
-from yt_dlp.postprocessor.metadataparser import MetadataParserPP
+from yt_dlp.postprocessor.common import PostProcessor
+from yt_dlp.utils import DownloadCancelled
 
 AUDIO_EXTS = {".mp3", ".m4a", ".opus", ".ogg", ".flac", ".wav"}
 
@@ -21,8 +26,10 @@ Log = Callable[[str], None]
 Progress = Callable[[float, str], None]  # (0..1, açıklama)
 
 
-class Cancelled(Exception):
-    pass
+class Cancelled(DownloadCancelled):
+    """yt-dlp `ignoreerrors` açıkken bile yutulmaz; iptal hemen etki eder."""
+
+    msg = "İptal edildi"
 
 
 # --------------------------------------------------------------------------- #
@@ -235,8 +242,10 @@ def _read_tags(path: Path) -> tuple[str | None, str | None, str]:
 
 @dataclass
 class Library:
-    ids: dict[str, str]  # YouTube video id → dosya yolu
-    keys: dict[str, str]  # sanatçı|şarkı → dosya yolu
+    ids: dict[str, str] = dataclasses.field(default_factory=dict)  # YouTube video id → dosya yolu
+    keys: dict[str, str] = dataclasses.field(default_factory=dict)  # sanatçı|şarkı → dosya yolu
+
+    lock: threading.Lock = dataclasses.field(default_factory=threading.Lock)
 
     def find(self, info: dict) -> str | None:
         """Bu şarkı daha önce indirildiyse mevcut dosyanın yolunu döndürür."""
@@ -261,9 +270,21 @@ def _info_artist(info: dict) -> str | None:
     return info.get("artist") or info.get("creator") or info.get("uploader")
 
 
-def scan_library(folders: list[str | Path], log: Log = print) -> Library:
-    lib = Library({}, {})
-    count = 0
+CACHE_NAME = ".library_cache.json"
+
+
+def scan_library(folders: list[str | Path], cache_file: Path | None = None, log: Log = print) -> Library:
+    """Klasörlerdeki müzikleri tarar. Etiketler `cache_file` içinde saklanır; sonraki
+    taramalarda yalnızca yeni veya değişmiş dosyaların etiketleri okunur."""
+    cache: dict = {}
+    if cache_file and cache_file.exists():
+        try:
+            cache = json.loads(cache_file.read_text("utf-8"))
+        except (OSError, ValueError):
+            cache = {}
+    new_cache: dict = {}
+    lib = Library()
+    count = read = 0
     for folder in folders:
         folder = Path(folder)
         if not folder.is_dir():
@@ -275,19 +296,97 @@ def scan_library(folders: list[str | Path], log: Log = print) -> Library:
                 if name.startswith(".") or Path(name).suffix.lower() not in AUDIO_EXTS:
                     continue
                 path = Path(dirpath) / name
-                artist, title, comment = _read_tags(path)
                 where = str(path)
-                m = _YT_ID.search(comment)
-                if m:
-                    lib.ids.setdefault(m.group(1), where)
-                if not title:  # etiket yoksa dosya adından: "01 - Şarkı.mp3"
-                    title = re.sub(r"^\d+\s*-\s*", "", path.stem)
-                key = song_key(artist, title)
-                if key:
-                    lib.keys.setdefault(key, where)
+                try:
+                    st = path.stat()
+                except OSError:
+                    continue
+                stamp = [st.st_size, int(st.st_mtime)]
+                entry = cache.get(where)
+                if not entry or entry.get("stamp") != stamp:
+                    artist, title, comment = _read_tags(path)
+                    m = _YT_ID.search(comment)
+                    if not title:  # etiket yoksa dosya adından: "01 - Şarkı.mp3"
+                        title = re.sub(r"^\d+\s*-\s*", "", path.stem)
+                    entry = {"stamp": stamp, "id": m.group(1) if m else None, "key": song_key(artist, title)}
+                    read += 1
+                new_cache[where] = entry
+                if entry["id"]:
+                    lib.ids.setdefault(entry["id"], where)
+                if entry["key"]:
+                    lib.keys.setdefault(entry["key"], where)
                 count += 1
-    log(f"Kütüphane tarandı: {count} şarkı bulundu.")
+    if cache_file:
+        # Şu an takılı olmayan kartların kayıtlarını da koru
+        scanned = [str(Path(f)) for f in folders]
+        for k, v in cache.items():
+            if k not in new_cache and not any(k.startswith(f + os.sep) for f in scanned):
+                new_cache[k] = v
+        try:
+            cache_file.parent.mkdir(parents=True, exist_ok=True)
+            cache_file.write_text(json.dumps(new_cache, ensure_ascii=False), "utf-8")
+        except OSError:
+            pass
+    log(f"Kütüphane tarandı: {count} şarkı ({read} yeni dosya okundu).")
     return lib
+
+
+# --------------------------------------------------------------------------- #
+# İndirme
+# --------------------------------------------------------------------------- #
+def fetch_playlist(url: str) -> tuple[str, list[dict]]:
+    """(albüm adı, parçalar) döndürür. Parçalar sadece id/url/başlık içerir (hızlı)."""
+    opts = {"quiet": True, "no_warnings": True, "extract_flat": "in_playlist", "skip_download": True}
+    with yt_dlp.YoutubeDL(opts) as ydl:
+        info = ydl.extract_info(url, download=False) or {}
+    if info.get("_type") != "playlist":  # tek video linki
+        return info.get("title") or "Album", [info]
+    entries = [e for e in (info.get("entries") or []) if e]
+    return info.get("title") or info.get("id") or "Album", entries
+
+
+class _SetTags(PostProcessor):
+    """Parça numarası ve albüm adını etiketlere yazılmak üzere bilgiye ekler."""
+
+    def __init__(self, track: int, album: str):
+        super().__init__()
+        self.track, self.album = track, album
+
+    def run(self, info):
+        info["track_number"] = self.track
+        if not info.get("album"):  # YouTube Music zaten doğru albüm adını verir
+            info["album"] = self.album
+        return [], info
+
+
+class _Logger:
+    def __init__(self, log: Log):
+        self.log = log
+
+    def debug(self, msg):
+        pass
+
+    info = warning = debug
+
+    def error(self, msg):
+        self.log(f"Hata: {msg}")
+
+
+@dataclass
+class Result:
+    album_dir: Path
+    card_dir: Path | None
+    downloaded: int = 0
+    skipped: int = 0
+    failed: int = 0
+    copied: int = 0
+
+
+def card_album_dir(card_root: str, sub_folder: str, album_name: str) -> Path:
+    dest = Path(card_root)
+    if sub_folder.strip():
+        dest = dest / safe_name(sub_folder.strip(), "Music")
+    return dest / album_name
 
 
 def download_album(
@@ -295,176 +394,195 @@ def download_album(
     out_root: Path,
     audio_format: str = "m4a",
     quality: str = "192",
-    library_dirs: list[str | Path] | None = None,
+    card_root: str | None = None,
+    sub_folder: str = "Music",
+    workers: int = 3,
     log: Log = print,
     progress: Progress = lambda f, s: None,
     is_cancelled: Callable[[], bool] = lambda: False,
-) -> Path:
-    """Albümü/çalma listesini `out_root/<Albüm Adı>/` klasörüne indirir ve klasörü döndürür.
+) -> Result:
+    """Albümü `out_root/<Albüm Adı>/` klasörüne indirir; `card_root` verilirse her şarkıyı
+    iner inmez karta kopyalar.
 
-    audio_format="m4a": YouTube'un AAC sesi dönüştürülmeden kopyalanır (kalite kaybı yok).
-    audio_format="mp3": ses MP3'e dönüştürülür (`quality` kbps).
-    Daha önce indirilmiş şarkılar (out_root ve library_dirs içinde) atlanır.
+    - `workers` parça aynı anda indirilir.
+    - audio_format="m4a": YouTube'un AAC sesi dönüştürülmeden kopyalanır (kalite kaybı yok).
+      audio_format="mp3": ses MP3'e dönüştürülür (`quality` kbps).
+    - Bilgisayarda veya kartta zaten bulunan şarkılar atlanır.
     """
     ffmpeg = find_ffmpeg()
     if not ffmpeg:
         raise RuntimeError("ffmpeg bulunamadı. 'pip install imageio-ffmpeg' komutunu çalıştırın.")
 
     log("Albüm bilgisi alınıyor...")
-    title = fetch_playlist_title(url)
+    title, entries = fetch_playlist(url)
+    if not entries:
+        raise RuntimeError("Bu linkte indirilecek şarkı bulunamadı.")
     album_dir = out_root / safe_name(title)
     album_dir.mkdir(parents=True, exist_ok=True)
-    log(f"Albüm: {title}")
+    card_dir = card_album_dir(card_root, sub_folder, album_dir.name) if card_root else None
+    log(f"Albüm: {title}  ({len(entries)} şarkı)")
     log(f"İndirme klasörü: {album_dir}")
 
     log("Daha önce indirilen şarkılar kontrol ediliyor...")
-    library = scan_library([out_root, *(library_dirs or [])], log)
-    stats = {"skipped": 0}
+    library = scan_library([out_root, *([card_root] if card_root else [])], out_root / CACHE_NAME, log)
 
-    def skip_duplicates(info, *, incomplete):
-        if incomplete or info.get("_type") == "playlist":
-            return None
-        if is_cancelled():
-            raise Cancelled()
-        existing = library.find(info)
-        name = info.get("track") or info.get("title") or info.get("id")
-        if existing:
-            stats["skipped"] += 1
-            log(f"↷ Atlandı, zaten var: {name}  ({existing})")
-            return "zaten indirilmiş"
-        # Aynı albümde iki kez geçse bile bir kez indir
-        library.add(info, f"{album_dir.name} (bu indirme)")
-        return None
-
-    state = {"index": 0, "total": 0}
-
-    def hook(d):
-        if is_cancelled():
-            raise Cancelled()
-        info = d.get("info_dict") or {}
-        state["index"] = info.get("playlist_index") or state["index"] or 1
-        state["total"] = info.get("n_entries") or info.get("playlist_count") or state["total"] or 1
-        done_tracks = state["index"] - 1
-        if d["status"] == "downloading":
-            total = d.get("total_bytes") or d.get("total_bytes_estimate") or 0
-            frac = (d.get("downloaded_bytes", 0) / total) if total else 0
-            progress(
-                (done_tracks + frac * 0.9) / state["total"],
-                f"[{state['index']}/{state['total']}] {info.get('title', '')}",
-            )
-        elif d["status"] == "finished":
-            progress((done_tracks + 0.9) / state["total"], f"[{state['index']}/{state['total']}] dönüştürülüyor...")
-
-    def pp_hook(d):
-        if is_cancelled():
-            raise Cancelled()
-        if d["status"] == "finished" and d.get("postprocessor") == "MoveFiles":
-            info = d.get("info_dict") or {}
-            log(f"✓ {info.get('title', '')}")
-
-    postprocessors = [
-        {
-            # Parça numarası ve albüm adını etiketlere yaz
-            "key": "MetadataParser",
-            "when": "pre_process",
-            "actions": [
-                (MetadataParserPP.interpretter, "playlist_index", "%(track_number)s"),
-                (MetadataParserPP.interpretter, "playlist_title", "%(album)s"),
-            ],
-        },
-        # m4a: kaynak AAC ise ffmpeg sadece kopyalar (yeniden kodlama yok)
-        {"key": "FFmpegExtractAudio", "preferredcodec": audio_format, "preferredquality": quality},
-        {"key": "FFmpegMetadata", "add_metadata": True},
-        {"key": "EmbedThumbnail", "already_have_thumbnail": False},
-    ]
-
-    opts = {
-        "format": "bestaudio[ext=m4a]/bestaudio/best" if audio_format == "m4a" else "bestaudio/best",
-        "match_filter": skip_duplicates,
-        "outtmpl": str(album_dir / "%(playlist_index)02d - %(title)s.%(ext)s"),
-        "windowsfilenames": True,  # SD kartta (FAT32/exFAT) geçersiz karakterleri temizler
-        "ignoreerrors": True,  # tek parça hata verirse albümün geri kalanı devam etsin
-        "writethumbnail": True,
-        "noplaylist": False,
-        "ffmpeg_location": ffmpeg,
-        "progress_hooks": [hook],
-        "postprocessor_hooks": [pp_hook],
-        "postprocessors": postprocessors,
-        "quiet": True,
-        "no_warnings": True,
-        "noprogress": True,
-    }
+    result = Result(album_dir, card_dir)
+    total = len(entries)
+    fracs = [0.0] * total
+    active: set[int] = set()
+    state_lock = threading.Lock()
     deno_bin = find_deno()
-    if deno_bin:
-        opts["js_runtimes"] = {"deno": {"path": deno_bin}}
-    else:
+    if not deno_bin:
         log("Uyarı: deno bulunamadı; bazı YouTube videoları indirilemeyebilir.")
 
-    class _Logger:
-        def debug(self, msg):
-            pass
+    def report():
+        with state_lock:
+            done = sum(1 for f in fracs if f >= 1)
+            overall = sum(fracs) / total
+            n_active = len(active)
+        progress(overall, f"{done}/{total} şarkı tamamlandı" + (f" · {n_active} iniyor" if n_active else ""))
 
-        def info(self, msg):
-            pass
+    def set_frac(i, value):
+        with state_lock:
+            fracs[i] = max(fracs[i], value)
+        report()
 
-        def warning(self, msg):
-            pass
+    # Karta yazma tek iş parçacığında: SD kartlar aynı anda birden çok yazmada yavaşlar
+    copier = ThreadPoolExecutor(max_workers=1) if card_dir else None
 
-        def error(self, msg):
-            log(f"Hata: {msg}")
-
-    opts["logger"] = _Logger()
-
-    log("İndirme başlıyor...")
-    with yt_dlp.YoutubeDL(opts) as ydl:
-        ydl.download([url])
-    if is_cancelled():
-        raise Cancelled()
-    if stats["skipped"]:
-        log(f"{stats['skipped']} şarkı zaten indirilmiş olduğu için atlandı.")
-    progress(1.0, "İndirme tamamlandı")
-    return album_dir
-
-
-# --------------------------------------------------------------------------- #
-# SD karta kopyalama
-# --------------------------------------------------------------------------- #
-def copy_to_card(
-    album_dir: Path,
-    card_root: str,
-    sub_folder: str = "Music",
-    log: Log = print,
-    progress: Progress = lambda f, s: None,
-    is_cancelled: Callable[[], bool] = lambda: False,
-) -> Path | None:
-    files = sorted(p for p in album_dir.iterdir() if p.is_file() and p.suffix.lower() in AUDIO_EXTS)
-    if not files:
-        log("Karta kopyalanacak yeni şarkı yok (hepsi zaten mevcut).")
-        progress(1.0, "Yeni şarkı yok")
-        return None
-
-    dest = Path(card_root)
-    if sub_folder.strip():
-        dest = dest / safe_name(sub_folder.strip(), "Music")
-    dest = dest / album_dir.name
-
-    need = sum(p.stat().st_size for p in files)
-    free = _free(card_root)
-    if free and need > free:
-        raise RuntimeError(f"Kartta yeterli yer yok: {human_size(need)} gerekli, {human_size(free)} boş.")
-
-    dest.mkdir(parents=True, exist_ok=True)
-    log(f"Karta kopyalanıyor: {dest}")
-    for i, src in enumerate(files, 1):
+    def copy_one(src: Path):
         if is_cancelled():
-            raise Cancelled()
-        target = dest / src.name
-        if target.exists() and target.stat().st_size == src.stat().st_size:
-            log(f"= Zaten var: {src.name}")
-        else:
-            progress((i - 1) / len(files), f"Kopyalanıyor [{i}/{len(files)}] {src.name}")
+            return
+        try:
+            card_dir.mkdir(parents=True, exist_ok=True)
+            target = card_dir / src.name
+            if target.exists() and target.stat().st_size == src.stat().st_size:
+                return
+            size = src.stat().st_size
+            free = _free(card_root)
+            if free and size > free:
+                raise RuntimeError(f"Kartta yer kalmadı ({human_size(free)} boş).")
             # copyfile: FAT32'de izin/tarih kopyalama hatalarını önler
             shutil.copyfile(src, target)
-            log(f"→ {src.name}")
-    progress(1.0, "Kopyalama tamamlandı")
-    return dest
+            with state_lock:
+                result.copied += 1
+            log(f"  → karta kopyalandı: {src.name}")
+        except Exception as e:  # noqa: BLE001
+            log(f"Hata: karta kopyalanamadı: {src.name}: {e}")
+
+    def one_track(i: int, entry: dict):
+        if is_cancelled():
+            return
+        with state_lock:
+            active.add(i)
+        track_no = entry.get("playlist_index") or i + 1
+        name = entry.get("title") or entry.get("id")
+        skipped = []
+
+        def hook(d):
+            if is_cancelled():
+                raise Cancelled()
+            if d["status"] == "downloading":
+                tot = d.get("total_bytes") or d.get("total_bytes_estimate") or 0
+                if tot:
+                    set_frac(i, d.get("downloaded_bytes", 0) / tot * 0.9)
+
+        def skip_duplicates(info, *, incomplete):
+            if incomplete:
+                return None
+            with library.lock:
+                existing = library.find(info)
+                if not existing:
+                    # Aynı albümde iki kez geçse bile bir kez indir
+                    library.add(info, f"{album_dir.name} (bu indirme)")
+            if existing:
+                skipped.append(existing)
+                log(f"↷ Atlandı, zaten var: {info.get('track') or info.get('title')}  ({existing})")
+                return "zaten indirilmiş"
+            return None
+
+        opts = {
+            "format": "bestaudio[ext=m4a]/bestaudio/best" if audio_format == "m4a" else "bestaudio/best",
+            "outtmpl": str(album_dir / f"{track_no:02d} - %(title)s.%(ext)s"),
+            "windowsfilenames": True,  # SD kartta (FAT32/exFAT) geçersiz karakterleri temizler
+            "ignoreerrors": True,  # tek parça hata verirse diğerleri devam etsin
+            "noplaylist": True,
+            "writethumbnail": True,
+            "match_filter": skip_duplicates,
+            "ffmpeg_location": ffmpeg,
+            "progress_hooks": [hook],
+            "postprocessors": [
+                # m4a: kaynak AAC ise ffmpeg sadece kopyalar (yeniden kodlama yok)
+                {"key": "FFmpegExtractAudio", "preferredcodec": audio_format, "preferredquality": quality},
+                {"key": "FFmpegMetadata", "add_metadata": True},
+                {"key": "EmbedThumbnail", "already_have_thumbnail": False},
+            ],
+            "quiet": True,
+            "no_warnings": True,
+            "noprogress": True,
+            "logger": _Logger(log),
+        }
+        if deno_bin:
+            opts["js_runtimes"] = {"deno": {"path": deno_bin}}
+        video_url = entry.get("url") or entry.get("webpage_url") or entry.get("id")
+        try:
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                ydl.add_post_processor(_SetTags(track_no, title), when="pre_process")
+                info = ydl.extract_info(video_url, download=True)
+            downloads = (info or {}).get("requested_downloads") or []
+            path = downloads[0].get("filepath") if downloads else None
+            ok = bool(path and os.path.exists(path))
+            with state_lock:
+                if ok:
+                    result.downloaded += 1
+                elif skipped:
+                    result.skipped += 1
+                else:
+                    result.failed += 1
+            if ok:
+                log(f"✓ {Path(path).stem}")
+                if copier:
+                    copier.submit(copy_one, Path(path))
+            elif not skipped:
+                log(f"✗ İndirilemedi: {name}")
+        finally:
+            with state_lock:
+                active.discard(i)
+            set_frac(i, 1.0)
+
+    log(f"İndirme başlıyor ({max(1, workers)} şarkı aynı anda)...")
+    report()
+    try:
+        with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
+            futures = [pool.submit(one_track, i, e) for i, e in enumerate(entries)]
+            for f in futures:
+                try:
+                    f.result()
+                except Cancelled:
+                    pass
+    finally:
+        if copier:
+            copier.shutdown(wait=True)
+    if is_cancelled():
+        raise Cancelled()
+
+    # Önceden bilgisayara inmiş ama kartta olmayan şarkıları da tamamla
+    if card_dir:
+        leftovers = [p for p in sorted(album_dir.iterdir())
+                     if p.is_file() and p.suffix.lower() in AUDIO_EXTS
+                     and not ((card_dir / p.name).exists() and (card_dir / p.name).stat().st_size == p.stat().st_size)]
+        for p in leftovers:
+            if is_cancelled():
+                raise Cancelled()
+            copy_one(p)
+
+    summary = f"{result.downloaded} şarkı indirildi"
+    if result.skipped:
+        summary += f", {result.skipped} şarkı zaten vardı (atlandı)"
+    if result.failed:
+        summary += f", {result.failed} şarkı indirilemedi"
+    if card_dir:
+        summary += f", {result.copied} şarkı karta kopyalandı"
+    log(summary + ".")
+    progress(1.0, "Tamamlandı")
+    return result
