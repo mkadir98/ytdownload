@@ -15,7 +15,8 @@ MP3 (veya M4A) olarak indirip **microSD karta otomatik aktaran** küçük bir ma
 - **Hızlı:** aynı anda 3 şarkı iner (1-6 arası ayarlanabilir) ve her şarkı iner inmez karta
   kopyalanır; albüm bittiğinde kopyalama da bitmiş olur
 - **Şarkı adlarını kısaltma (tuşlu / küçük ekranlı telefonlar için):**
-  `04 - Gripin- Durma Yağmur Durma (piyano cover)- İlayda Su Çakıroğlu.mp3` → `04 Durma Yağmur Durma.mp3`.
+  `04 - Gripin- Durma Yağmur Durma (piyano cover)- İlayda Su Çakıroğlu.mp3` → `Durma Yağmur Durma.mp3`
+  (başa sıra numarası istenirse **Numara** kutusu işaretlenir).
   Hem dosya adı hem dosyanın içindeki şarkı adı etiketi kısaltılır. İki yol var:
   - İndirirken: **Şarkı adları → Kısalt** kutusunu işaretleyin.
   - Mevcut şarkılar için: **Şarkı adlarını kısalt...** düğmesi. Önce önizleme gösterir; adı elle

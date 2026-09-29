@@ -40,7 +40,7 @@ class App(tk.Tk):
         self.workers_var = tk.IntVar(value=3)
         self.shorten_var = tk.BooleanVar(value=False)
         self.maxlen_var = tk.IntVar(value=24)
-        self.number_var = tk.BooleanVar(value=True)
+        self.number_var = tk.BooleanVar(value=False)
         self.ascii_var = tk.BooleanVar(value=False)
         self.status_var = tk.StringVar(value="Hazır")
 

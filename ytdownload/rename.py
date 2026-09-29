@@ -22,7 +22,7 @@ from . import core
 @dataclass
 class RenameOptions:
     max_len: int = 24  # uzantı hariç dosya adının en fazla uzunluğu (numara dahil)
-    number: bool = True  # başa parça numarası koy ("04 Şarkı")
+    number: bool = False  # başa parça numarası koy ("04 Şarkı")
     ascii_only: bool = False  # ğ→g, ş→s ... (Türkçe harfleri gösteremeyen telefonlar için)
 
 
