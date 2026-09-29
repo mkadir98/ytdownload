@@ -105,6 +105,13 @@ def short_title(title: str, artists: Iterable[str] = (), max_len: int = 40, asci
     words = name.split()
     while len(words) > 1 and _fold(words[-1]) in _TRAILING_NOISE:
         words.pop()
+    # Ayraçsız yapışık sanatçı adı: "Helin Çelik Mutlu Yıllar" → "Mutlu Yıllar"
+    for a in sorted({_fold(a) for a in artists if _fold(a)}, key=len, reverse=True):
+        k = len(a.split())
+        if len(words) > k and _fold(" ".join(words[:k])) == a:
+            words = words[k:]
+        elif len(words) > k and _fold(" ".join(words[-k:])) == a:
+            words = words[:-k]
     name = " ".join(words).strip(" -–—|&,.+/'")
     if ascii_only:
         name = to_ascii(name)
@@ -250,11 +257,15 @@ def plan_file(path: Path, opts: RenameOptions, info: dict | None = None, number:
         source = info.get("track") or info.get("title") or tag_title or stem_title
         artists = artists_from_info(info)
     else:
-        source = tag_title or stem_title
+        # Daha önce kısaltıldıysa saklanan orijinal başlıktan yeniden hesapla (ayar değişince
+        # kesilen kelimeler geri gelebilsin); sonuç her çalıştırmada aynı olur
+        source = core._read_original_title(path) or tag_title or stem_title
         artists = _split_artists(artist)
     prefix = f"{number:02d} " if opts.number and number else ""
-    short = short_title(source, artists, max_len=max(8, opts.max_len - len(prefix)), ascii_only=opts.ascii_only)
-    return RenamePlan(path, f"{prefix}{short}{path.suffix.lower()}", tag_title, short)
+    ext = path.suffix.lower()
+    limit = max(8, opts.max_len - len(prefix))
+    short = short_title(source, artists, max_len=limit, ascii_only=opts.ascii_only)
+    return RenamePlan(path, f"{prefix}{short}{ext}", tag_title, short)
 
 
 def _audio_files(folder: Path) -> list[Path]:
@@ -283,11 +294,28 @@ def make_unique(plans: list[RenamePlan]):
     """Aynı klasörde iki dosyanın aynı adı almasını önler ("Şarkı", "Şarkı 2")."""
     by_dir: dict[Path, set[str]] = {}
     renaming = {p.path for p in plans}
+
+    def taken_in(folder: Path) -> set[str]:
+        if folder not in by_dir:
+            by_dir[folder] = {f.name.casefold() for f in folder.iterdir() if f not in renaming}
+        return by_dir[folder]
+
+    # 1) Zaten uygun adı olan ("Şarkı.mp3" ya da "Şarkı 2.mp3") dosya adını korur;
+    #    böylece aynı adlı iki dosya her çalıştırmada yer değiştirmez.
+    pending = []
     for p in plans:
-        taken = by_dir.get(p.path.parent)
-        if taken is None:
-            taken = {f.name.casefold() for f in p.path.parent.iterdir() if f not in renaming}
-            by_dir[p.path.parent] = taken
+        stem, ext = os.path.splitext(p.new_name)
+        current = p.path.name
+        fits = current == p.new_name or re.fullmatch(re.escape(stem) + r" \d+" + re.escape(ext), current)
+        taken = taken_in(p.path.parent)
+        if fits and current.casefold() not in taken:
+            p.new_name = current
+            taken.add(current.casefold())
+        else:
+            pending.append(p)
+    # 2) Kalanlara boş ad ver
+    for p in pending:
+        taken = taken_in(p.path.parent)
         stem, ext = os.path.splitext(p.new_name)
         name, n = p.new_name, 2
         while name.casefold() in taken:
@@ -316,6 +344,38 @@ def apply_plan(plan: RenamePlan) -> Path:
     return target
 
 
+def apply_plans(plans: list[RenamePlan], progress: Callable[[int, int], None] = lambda i, n: None
+                ) -> tuple[list[tuple[RenamePlan, Path]], list[str]]:
+    """Birden çok planı güvenle uygular: önce geçici adlara, sonra asıl adlara taşır.
+    Böylece "A → B, B → A" gibi zincirlerde dosyalar birbirinin üstüne yazılmaz."""
+    done, errors, staged = [], [], []
+    for i, p in enumerate(plans, 1):
+        try:
+            if (p.old_title or "") != p.new_title:
+                write_title(p.path, p.new_title)
+            if p.new_name != p.path.name:
+                tmp = p.path.with_name(f"{p.path.name}.{i}.tmp_rename")
+                os.replace(p.path, tmp)
+                staged.append((p, tmp))
+            else:
+                done.append((p, p.path))
+        except Exception as e:  # noqa: BLE001
+            errors.append(f"{p.path.name}: {e}")
+        progress(i, len(plans) * 2)
+    for j, (p, tmp) in enumerate(staged, 1):
+        target = p.path.with_name(p.new_name)
+        try:
+            if target.exists():
+                raise FileExistsError(f"Bu adda dosya zaten var: {target.name}")
+            os.replace(tmp, target)
+            done.append((p, target))
+        except Exception as e:  # noqa: BLE001
+            os.replace(tmp, p.path)  # asıl adına geri koy
+            errors.append(f"{p.path.name}: {e}")
+        progress(len(plans) + j, len(plans) * 2)
+    return done, errors
+
+
 def undo_plan(plan: RenamePlan, new_path: Path):
     """apply_plan'ı geri alır."""
     if new_path.name != plan.path.name and new_path.exists():
@@ -342,7 +402,9 @@ def _main():
     opts = RenameOptions(max_len=int(sys.argv[2]) if len(sys.argv) > 2 else 24)
     for p in plan_folder(sys.argv[1], opts):
         mark = "→" if p.changed else "="
-        print(f"{p.path.name}\n    {mark} {p.new_name}   [etiket: {p.old_title!r} → {p.new_title!r}]")
+        artist = core._read_tags(p.path)[0]
+        original = core._read_original_title(p.path) or p.old_title
+        print(f"{p.path.name}\n    {mark} {p.new_name}   [orijinal: {original!r} | sanatçı: {artist!r}]")
 
 
 if __name__ == "__main__":

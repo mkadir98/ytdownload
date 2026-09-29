@@ -166,13 +166,8 @@ class RenameDialog(tk.Toplevel):
         folder = Path(self.folder_var.get())
 
         def work():
-            done, errors = [], []
-            for i, p in enumerate(plans, 1):
-                try:
-                    done.append((p, rename.apply_plan(p)))
-                except Exception as e:  # noqa: BLE001
-                    errors.append(f"{p.path.name}: {e}")
-                self._events.put(("status", f"Değiştiriliyor {i}/{len(plans)}..."))
+            done, errors = rename.apply_plans(
+                plans, progress=lambda i, n: self._events.put(("status", f"Değiştiriliyor {i}/{n}...")))
             core.clean_mac_junk(folder)
             self._events.put(("applied", (done, errors)))
 
